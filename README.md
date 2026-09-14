@@ -1,238 +1,439 @@
-# RevOps Deal Risk Assessment & Alert System
+# RevOps Deal Risk Alert System
 
-An n8n automation that scores every open HubSpot deal each morning, explains *why* a deal is at risk, maintains an action queue in Google Sheets, and sends Slack alerts only when something has genuinely changed.
+An n8n automation that evaluates open HubSpot deals for revenue and execution risk, explains *why* a deal is at risk, maintains an operational action queue in Google Sheets, and sends actionable Slack alerts for high-priority opportunities.
 
-This repository contains two versions of the same project: the working prototype I built first, and the optimized version it became. The point of keeping both is to show the reasoning between them.
+This repository contains two versions of the same project: the **first working implementation I built** and the **optimized version it became**.
+
+The point of keeping both is to show the reasoning between them — not just the finished workflow.
 
 ---
 
 ## The business problem
 
-Sales teams can't manually inspect every open opportunity. A manager with 200 deals in the pipeline cannot check each one for stalled activity, slipping close dates, or missing next steps — so deals go quiet and nobody notices until the forecast misses.
+Sales teams cannot manually inspect every open opportunity.
 
-The CRM already holds the signals. What it doesn't do is turn them into a prioritised, explained list of the handful of deals that need attention *today*. HubSpot can tell you a deal hasn't been touched in 45 days; it can't tell you that this particular deal is the one worth interrupting your morning for, and why.
+A manager with a large pipeline cannot check every deal for stalled activity, slipping close dates, missing next steps, forecast risk, or execution gaps. The CRM contains many of the signals, but those signals do not automatically become a clear decision about **which deal needs attention now and why**.
 
-That gap — between raw CRM fields and an actionable decision — is what this system fills.
+This system is designed to close that gap:
+
+> **Raw CRM data → risk assessment → explanation → action → alert**
+
+Instead of giving a manager another list of CRM fields, the system tries to answer:
+
+**Which deals are risky?**
+**How serious is the risk?**
+**Why is the deal risky?**
+**What should a person review next?**
 
 ---
 
 ## What the system does
 
-```
-HubSpot  →  Load prior state  →  Score & classify  →  Decide what changed
-                                                            ↓
-                          ┌─────────────────────────────────┼──────────────────┐
-                          ↓                                 ↓                  ↓
-                   Audit log & summary            Action queue + Slack     Resolution
-                    (Google Sheets)                (only if changed)      (close the loop)
+```text
+HubSpot
+   ↓
+Load open deals
+   ↓
+Risk assessment
+   ↓
+Risk score + risk drivers
+   ↓
+High / Critical?
+   ├── No → continue normal processing
+   │
+   └── Yes
+         ↓
+    AI business assessment
+         ↓
+    Action queue
+         ↓
+    Slack alert
 ```
 
-Every weekday morning the workflow:
+The optimized version extends this basic idea with persistent state, alert lifecycle handling, change detection, and stronger error handling.
 
-1. **Pulls all open deals** from HubSpot with the properties the risk rules need.
-2. **Loads its own memory** — what it last told a human about each deal, and where each deal's close date used to be.
-3. **Scores each deal** against a deterministic rubric covering stalled activity, overdue and repeatedly-pushed close dates, single-threading, and CRM data gaps.
-4. **Compares against the last delivered alert** and decides: alert, refresh quietly, mark resolved, or do nothing.
-5. **Writes the record first**, then sends Slack — so a notification failure never loses the row.
-6. **Records state only after Slack confirms delivery**, so a failed send means the deal re-alerts tomorrow rather than being silently suppressed.
+At a high level, the system:
+
+1. **Reads open deals** from HubSpot with the properties required for assessment.
+2. **Evaluates deterministic risk signals** such as close-date problems, inactivity, missing next steps, missing ownership, and other execution gaps.
+3. **Calculates a risk score and severity** using explicit business rules.
+4. **Explains the detected risk** through human-readable risk drivers.
+5. **Uses AI only where it adds value** — interpreting business impact and suggesting a next action for higher-risk deals.
+6. **Stores the assessment** in Google Sheets.
+7. **Maintains an operational action queue** for deals requiring human review.
+8. **Sends Slack alerts** for high and critical opportunities.
+9. In the optimized version, **tracks state and changes over time** so alerts do not simply repeat every run.
 
 ---
 
-## Version 1 — the prototype
+## Version 1 — the first working prototype
 
-**`workflows/01-deal-risk-alert-system-prototype.json`** — 13 nodes, no custom code.
+**`workflows/01-deal-risk-monitoring-assessment-system-first-draft.json`**
 
-This was a working system, not a failed attempt. It ran daily, scored every open deal, wrote an action queue, and sent Slack alerts that people actually read.
+This was my first substantial working implementation.
 
-I built it entirely from native n8n nodes because that's what I was confident I could reason about and debug. The risk calculation is a chain of five Set nodes:
+It was not a throwaway experiment and it was not designed to be artificially simple. I started with the business problem and built the workflow around the logic I believed a RevOps team would need.
 
-```
-Prepare Deal Data → Calculate Activity Age → Check Data Completeness
-                  → Calculate Risk Score → Assign Risk Level
-```
+The first version could:
 
-Each node does one visible thing. Flatten the HubSpot response. Turn dates into day counts. Flag missing fields. Sum the weights. Band the score. You can click any node and see exactly what it produced, which is genuinely useful when you're still learning.
+* read open HubSpot deals
+* identify multiple risk signals
+* calculate a deterministic risk score
+* classify risk as LOW, MODERATE, HIGH, or CRITICAL
+* generate human-readable risk drivers
+* calculate run-level risk statistics
+* send higher-risk deals through an AI assessment
+* maintain structured AI output
+* write deal assessments to Google Sheets
+* maintain an Action Queue
+* send severity-based Slack alerts
+* route some workflow failures to an operational Slack alert
 
-**What it proved:** the business logic worked. The signals were the right signals, the weighting was roughly sensible, and a scored, explained queue was more useful to a manager than a CRM view.
+The core risk engine was implemented in JavaScript because the scoring logic had already become more involved than a simple sequence of IF conditions.
 
-**What it couldn't do:**
+The engine evaluated signals including:
 
-- **No memory.** It appended to the action queue every run, so the same deal reappeared every morning and the sheet filled with duplicates.
-- **No deduplication.** Slack fired for every at-risk deal every day, which is how alerting systems get muted.
-- **No resolution.** A deal that recovered stayed in the queue forever.
-- **No error handling.** Any API failure stopped the run with no notification.
-- **Scoring weighted toward data quality.** Verified by replaying the expressions: a deal with no activity for 90 days scored 25 (MODERATE, no alert), while a brand-new lead with four empty fields scored 50 (HIGH, alerted). The rubric was reliably catching CRM hygiene and staying quiet about stalled revenue.
+* missing or invalid deal amount
+* unassigned deals
+* missing next steps
+* missing close dates
+* overdue close dates
+* stalled or aging activity
+* near-close execution gaps
+* high-value opportunities
 
-That last point is the one I'd have missed without a structured review, and it's the single most valuable thing that came out of the next stage.
+It then produced a score, risk level, issue codes, severity information, risk drivers, and a score breakdown.
+
+For HIGH and CRITICAL deals, the workflow used an AI analysis step for a different purpose: the deterministic logic decided **whether the deal was risky**, while the AI was asked to interpret the business impact and recommend one concrete human action. The deterministic risk level remained authoritative.
+
+I also used structured output validation and reattached the AI response to the original deal using the deal ID rather than relying on item position.
+
+### What this version proved
+
+The first version proved that I could translate a RevOps requirement into a working automation rather than simply building an API-to-Slack workflow.
+
+It demonstrated that the system could:
+
+**identify risk → explain the risk → prioritize it → produce an operational output.**
+
+It also helped expose where the architecture needed to mature.
+
+### What this version revealed
+
+* **The implementation became code-heavy.**
+  The scoring engine, run summary, AI result reconstruction, and error formatting used custom JavaScript. The logic worked, but the workflow was becoming harder to reason about as the number of responsibilities grew.
+
+* **Risk calculation and workflow orchestration were starting to become tightly coupled.**
+  The business rules were working, but the structure made later changes more expensive.
+
+* **The workflow had limited lifecycle awareness.**
+  The Action Queue could maintain deal records using the deal ID as a matching key, but the mature alert lifecycle of the optimized workflow was not yet present.
+
+* **The AI step needed strict boundaries.**
+  I did not want an LLM deciding whether a deal was HIGH or CRITICAL. The deterministic model remained the source of truth, while AI was limited to business interpretation and next-action guidance.
+
+* **Operational edge cases needed more attention.**
+  Error paths existed, but the workflow had not yet evolved into the more deliberate state, delivery, and failure-handling architecture of the final version.
+
+The first draft therefore became more than a prototype: it became the baseline I could critically evaluate.
 
 ---
 
-## Version 2 — from prototype to optimized
+## Version 2 — from working prototype to optimized system
 
-**`workflows/02-deal-risk-alert-system-optimized.json`** — 32 nodes, 8 Code nodes.
+**`workflows/02-deal-risk-alert-system-optimized.json`**
 
-The prototype proved the concept but had structural limits. Five Set nodes to score one deal meant the scoring rules lived in five places; adding a signal meant touching several nodes and hoping nothing drifted. There was no way to remember what had already been said, which meant no way to be quiet.
+The first version proved the business logic. The next question was:
 
-I used AI to review the workflow end to end — node settings, expressions, execution behaviour, data flow, failure modes. The review surfaced things I hadn't considered, and a few I'd got wrong:
+> **Can the same business outcome be achieved with a cleaner, more reliable and more maintainable architecture?**
 
-| Finding | Change made |
-|---|---|
-| Scoring rubric inverted business priority | Separated genuine deal risk from CRM data quality into two buckets, and re-weighted so a stall or a slipping date can reach HIGH on its own |
-| Five Set nodes computing one score | Consolidated into one Code node where every threshold sits in a single labelled config block |
-| Alerts repeated daily | Added state tracking in n8n Data Tables — alert only when the level, the issue set, or the score by 5+ points has changed |
-| Alert state committed regardless of delivery | Chained the state write behind Slack's success output, so a failed send means re-alert tomorrow instead of permanent suppression |
-| No resolution path | Added a resolution branch and a reaper for deals that leave the pipeline entirely |
-| No failure visibility | Single error sink that aggregates failures into one message naming the affected deal IDs |
-| Close dates that keep moving were invisible | Added a second Data Table tracking last-seen close date and a push counter |
+I used AI to review the workflow end to end — including node settings, expressions, data flow, execution behaviour, failure modes, state handling, and business logic.
 
-JavaScript was introduced where it earned its place: joining three data sources, cross-referencing prior state, and expressing branching arithmetic over a dozen signals. Expressing that as native nodes would have needed 15+ IF/Set nodes and made the thresholds harder to audit, not easier. Where native nodes were still the clearer choice — filtering, routing, branching — they stayed.
+The review surfaced both technical and business issues that were difficult to see from the workflow canvas alone.
+
+| Finding                                                          | Change made                                                                                    |
+| ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Risk scoring mixed business risk with CRM data quality           | Separated genuine deal risk from data-quality signals and rebalanced their influence           |
+| Multiple workflow steps were performing related transformations  | Consolidated suitable logic into focused Code nodes where that made the architecture clearer   |
+| Alerts could repeat without meaningful change                    | Added persistent state and change detection                                                    |
+| Alert state could become inconsistent with notification delivery | Changed state handling so delivery success is considered before committing the alert state     |
+| No complete resolution lifecycle                                 | Added resolution handling for deals whose risk clears or whose deal leaves the active pipeline |
+| Close-date movement was difficult to track                       | Added persistent close-date history and push tracking                                          |
+| Failure visibility was limited                                   | Added centralized operational error handling                                                   |
+| AI output needed stronger guarantees                             | Added structured output validation and deterministic fallback behaviour                        |
+
+JavaScript was introduced where it provided a genuine architectural advantage — particularly for scoring arithmetic, state comparison, data joining, and multi-signal logic.
+
+The goal was **not** to replace native n8n nodes just to reduce the node count.
+
+Native nodes remained where they were clearer — for example, filtering, branching, routing and integration points.
+
+The important change was moving from:
+
+> **"many nodes because each small operation gets its own node"**
+
+toward:
+
+> **"use the right abstraction for each kind of logic."**
 
 ---
 
 ## How I used AI
 
-AI was a development assistant on this project, not a black box that produced a workflow.
+AI was a development assistant on this project, not a black box that produced a workflow I blindly imported.
 
-**Analyse.** I gave the working prototype to an AI model and asked for a structured audit — execution settings, expressions, data flow, failure modes, business logic. It produced findings I could check rather than conclusions I had to trust.
+### Analyse
 
-**Understand before implementing.** For every Code block proposed, I worked through what it receives, what it returns, which nodes it replaces, and what happens when the input is empty or malformed, *before* putting it in the workflow. Where I couldn't follow the reasoning, I asked for it to be explained or simplified rather than pasting it in. Some suggestions I rejected — merging the two Slack nodes, for example, would have removed the ability to route CRITICAL and HIGH to different channels later.
+I used AI to review the working prototype at a deeper level:
 
-**Implement.** Changes went into the workflow incrementally, with the riskiest behavioural change — the scoring re-weighting — separated from the pure reliability fixes so the two could be evaluated independently.
+* node settings
+* expressions
+* data flow
+* execution behaviour
+* business logic
+* error handling
+* state management
+* performance
+* maintainability
 
-**Verify.** The scoring model was tested against constructed deal scenarios to confirm it behaved as intended, rather than assuming it did. That's how the inverted-priority finding was confirmed: a $5M deal stalled 45 days scored MODERATE and never alerted, which is the opposite of the system's purpose.
+### Understand before implementing
 
-**What this demonstrates:** I understood the business problem and designed the workflow around it, built and ran a working prototype, used AI to find what I couldn't see myself, and made sure I understood each technical change before shipping it. I did not write the advanced JavaScript from scratch — I specified what it needed to do, reviewed what it did, and validated the result.
+When AI proposed JavaScript or architectural changes, I first worked through:
+
+* what the code receives
+* what it returns
+* what business rule it implements
+* which nodes it replaces
+* how multiple items are handled
+* what happens with missing or unexpected input
+
+The goal was to understand the change before using it.
+
+### Implement
+
+Useful changes were then incorporated into the workflow incrementally.
+
+I did not treat AI-generated code as automatically correct.
+
+### Verify
+
+I checked whether the resulting behaviour still matched the business requirement and whether the changes introduced new failure modes.
+
+This distinction matters:
+
+**AI helped with technical implementation and review. It did not replace the need to understand the workflow.**
 
 ---
 
 ## Prototype vs optimized
 
-| Area | Prototype | Optimized |
-|---|---|---|
-| **Architecture** | Linear chain: fetch → 5 transform nodes → filter → sheet + Slack | Staged: ingest → load state → score → route four ways → alert / refresh / resolve |
-| **Risk logic** | One weighted score out of 100, everything in one bucket | Deal risk and data quality scored separately; hygiene contributes at half weight and is suppressed for deals under 7 days old |
-| **Node count** | 13 nodes | 32 nodes — more capability, not more complexity per unit of work |
-| **Coding** | 0 Code nodes; 5 Set nodes to score a deal | 8 Code nodes; **1** node to score a deal, with all thresholds in one config block |
-| **Data handling** | Field-by-field through chained Set nodes | Single pass joining deals, alert state and close-date history |
-| **State tracking** | None — appended a new row every run | Two n8n Data Tables: alert state and close-date tracking, both bulk-read once per run |
-| **Error handling** | None — a failure stopped the run silently | Every external call routes errors to one aggregating sink that names affected deals; the final Slack node deliberately fails loudly so bad runs show red |
-| **Scalability** | Action queue grew by one row per at-risk deal per day | Queue keyed on deal ID; audit log isolated in its own spreadsheet to protect the cell limit |
-| **Maintainability** | Change a weight, edit several nodes | Change a weight, edit one line in one config block |
-| **Alerts** | Every at-risk deal, every day | Only on material change: new risk, level change, different issues, or a 5+ point move |
-| **AI usage** | None | One field — the recommended next action — with a deterministic fallback if it fails |
+| Area                | First Draft                                                                   | Optimized                                                                            |
+| ------------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| **Architecture**    | Business logic implemented across several dedicated processing and Code nodes | More deliberate separation of ingestion, assessment, state, routing and notification |
+| **Risk logic**      | Deterministic multi-signal score with explicit risk drivers                   | Refined scoring and clearer separation of business risk vs data quality              |
+| **Coding**          | Several Code nodes handling scoring, aggregation and data reconstruction      | Code concentrated where it provides a real structural advantage                      |
+| **Data handling**   | Deal data transformed and enriched through the workflow                       | More deliberate joining and state-aware processing                                   |
+| **State tracking**  | Action Queue provided operational storage but had limited lifecycle awareness | Persistent state and change detection support alert lifecycle                        |
+| **Alerts**          | High / Critical routing with Slack notifications                              | Alerts designed around meaningful state/change rather than simple repeated detection |
+| **Error handling**  | Dedicated error-formatting and Slack error paths                              | More deliberate failure handling and visibility                                      |
+| **AI usage**        | AI used for business interpretation of high-risk opportunities                | AI kept bounded to areas where deterministic logic is insufficient                   |
+| **Maintainability** | Working but increasingly code-heavy as requirements grew                      | Logic consolidated and responsibilities made easier to reason about                  |
+| **Scalability**     | Suitable as an initial working implementation                                 | Designed with repeated executions, state and growing history in mind                 |
 
 ---
 
 ## Key design decisions
 
-**Scoring stays deterministic; AI only writes one sentence.** Nothing downstream reads a severity from a language model. Score, level, trend and routing are all computed in code. The model produces the recommended next action and nothing else, because that's the one output deterministic logic genuinely can't produce. If the model fails, a driver-specific fallback fires instead and the alert still goes out.
+### Scoring stays deterministic; AI does not decide severity
 
-**Compare against the last *alerted* state, not the last *seen* state.** A deal drifting 44 → 47 → 50 should alert on the third run — not never, and not all three times. Storing the state at the point of alert, rather than the state at last scan, is what makes that work.
+The system does not ask an LLM whether a deal is HIGH or CRITICAL.
 
-**Record state only after delivery is confirmed.** In the prototype-era design the state write ran alongside the Slack send. If Slack failed, the system still recorded "alerted" and suppressed the deal from then on. Now the state write sits downstream of Slack's success output, so a failed send means the deal re-alerts tomorrow.
+Risk score, risk level, and routing remain deterministic.
 
-**Data quality is not deal risk.** A deal missing an amount is a CRM problem. A $5M deal untouched for six weeks is a revenue problem. Scoring them in the same bucket meant the second was drowned out by the first. They're now scored separately, with data quality contributing at half weight.
+AI is used for business interpretation and action guidance, where there is more value in language-based reasoning.
 
-**Preserve the evidence.** When a deal resolves, only eight columns are rewritten. The risk drivers and the recommended action are deliberately left untouched, because Google Sheets' `appendOrUpdate` leaves unmapped columns alone — so the record of *why* the deal was flagged survives its resolution.
+This creates a clear boundary:
 
-**Write the durable record before notifying.** In n8n's v1 execution order, parallel branches run in canvas position order. The sheet write sits above the Slack branch on purpose: if the notification fails, the row still exists.
+**Deterministic logic decides. AI explains and assists.**
+
+---
+
+### Business risk is different from CRM data quality
+
+A missing close date is a data-quality problem.
+
+A high-value deal that has stalled and is approaching its expected close date is a revenue problem.
+
+These are related, but they are not the same thing.
+
+The optimized workflow therefore treats them deliberately instead of allowing CRM hygiene issues to dominate the overall risk signal.
+
+---
+
+### The Action Queue is an operational output, not a second CRM
+
+The workflow does not attempt to reproduce every field already available in HubSpot.
+
+The Action Queue exists to help a human answer:
+
+> **Which deals need attention, why, and what should happen next?**
+
+This keeps the automation focused on decision support rather than recreating the CRM.
+
+---
+
+### AI output is validated before it is used
+
+The AI response is structured and validated before downstream processing.
+
+The deterministic deal data is then reattached using the deal ID rather than trusting item position.
+
+That means the LLM contributes its intended output without becoming the source of truth for the underlying deal record.
+
+---
+
+### Reliability matters more than simply reducing node count
+
+A workflow with fewer nodes is not automatically better.
+
+The objective of the optimization was to reduce unnecessary complexity while keeping the architecture understandable, testable and reliable.
 
 ---
 
 ## What the system outputs
 
-| Output | Where | Contents |
-|---|---|---|
-| **Action queue** | Google Sheets | One row per at-risk deal: owner, amount, score, level, trend, drivers, recommended action, days at risk, status |
-| **Slack alert** | Slack | Deal name linked to HubSpot, owner, amount, score with level and trend, close status, why it fired, top 3 drivers, recommended action |
-| **Assessment log** | Google Sheets | One row per deal per day, including the score breakdown — makes the model auditable |
-| **Alert log** | Google Sheets | One row per *delivered* alert — proof of what was actually sent |
-| **Resolution log** | Google Sheets | One row per resolution, distinguishing a deal that recovered from one that left the pipeline |
-| **Run summary** | Google Sheets | Daily counts by risk level, total exposure, and two health metrics that flag if the model drifts |
+| Output                   | Where                | Purpose                                                     |
+| ------------------------ | -------------------- | ----------------------------------------------------------- |
+| **Deal risk assessment** | Google Sheets        | Record of the assessment and supporting risk information    |
+| **Action queue**         | Google Sheets        | Operational list of opportunities requiring human attention |
+| **Slack alert**          | Slack                | Immediate notification for high-priority risk               |
+| **Run summary**          | Google Sheets        | High-level information about the assessment run             |
+| **Risk drivers**         | Sheets / Slack       | Human-readable explanation of why the deal was flagged      |
+| **Recommended action**   | Action Queue / Slack | Converts detection into something a person can act on       |
+
+The exact outputs and lifecycle behaviour become more sophisticated in the optimized version.
 
 ---
 
 ## Example
 
-What a manager sees in Slack:
+A useful risk alert should not simply say:
 
-```
-🚨 CRITICAL DEAL RISK
-
-Deal: Acme Corp - Platform Expansion
-Owner: 4471029
-Amount: 250,000
-Risk: 75/100 (CRITICAL) · RISING
-Close: 12 days overdue
-Why now: RISK_LEVEL_CHANGED
-
-Risk drivers:
-• Only one contact associated, so the deal depends on a single relationship.
-• No sales activity for 45 days, deal is stalling.
-• Close date 12 days overdue, indicating forecast slippage.
-
-Recommended action: Identify and engage a second stakeholder this week before advancing the deal.
+```text
+Deal is at risk.
 ```
 
-Compare that with "this deal is at risk." The alert answers which deal, whose, how much is exposed, how serious, what specifically is wrong, **what changed since last time**, and what to do about it. `RISING` tells the manager the deal is getting worse, not just that it's bad — those need different responses. And because of the deduplication gate, this message only appears when something actually changed, which is why the channel stays worth reading.
+A more useful operational output is:
+
+```text
+Risk: 68 / CRITICAL
+
+Drivers:
+• 45 days inactive
+• Close date in 5 days
+• Missing next step
+
+Recommended action:
+Review the opportunity and establish the next concrete customer action.
+```
+
+The important idea is that a sales user should be able to understand:
+
+**which deal → how serious → why → what to investigate next**
+
+without opening several CRM screens first.
 
 ---
 
 ## Technology
 
-- **n8n** — workflow orchestration, Code nodes, Data Tables
-- **HubSpot CRM** — deal data via the CRM search API (read-only)
-- **Google Sheets** — action queue, audit log, alert log, resolution log, run summary
-- **Slack** — alert delivery
-- **JavaScript** — in n8n Code nodes, for scoring, state comparison and data joins
-- **Google Gemini via OpenRouter** — one field per alerted deal
-- **AI-assisted development** — used for workflow analysis and code implementation, reviewed before use
+* **n8n** — workflow orchestration
+* **HubSpot CRM** — source of deal data
+* **Google Sheets** — operational records, assessment data and summaries
+* **Slack** — alert delivery
+* **JavaScript** — selected n8n Code nodes for deterministic logic and data processing
+* **LLM / AI** — business interpretation and next-action assistance
+* **AI-assisted development** — workflow review, technical analysis and implementation assistance
 
 ---
 
 ## Repository structure
 
-```
+```text
 revops-deal-risk-alert-system/
 ├── README.md
 ├── workflows/
-│   ├── 01-deal-risk-alert-system-prototype.json     # v1 — native nodes, no code
-│   └── 02-deal-risk-alert-system-optimized.json     # v2 — production version
+│   ├── 01-deal-risk-monitoring-assessment-system-first-draft.json
+│   └── 02-deal-risk-alert-system-optimized.json
 └── docs/
-    ├── architecture-and-node-reference.md           # every node: what, why, how
-    └── setup.md                                      # import and configuration
+    ├── architecture-and-node-reference.md
+    └── setup.md
 ```
 
-Both workflow files import into n8n directly. Credentials and account-specific IDs have been replaced with placeholders — see `docs/setup.md`.
+Credentials, account-specific IDs and other deployment-specific values are replaced with placeholders in the public workflow files.
 
 ---
 
 ## What this project demonstrates
 
-- Translating a real revenue-operations problem into an automation with a defined output
-- Designing a risk model around business signals rather than available data fields
-- Building and running a working system in n8n using native nodes
-- Recognising the limits of a first design, and knowing which limits mattered
-- Using AI to analyse an existing system and implement improvements, with the judgement to evaluate what it produced
-- Understanding n8n execution behaviour: item handling, execution order, error outputs, state persistence
-- Reading and reasoning about JavaScript well enough to verify what it does before shipping it
-- Testing business logic against constructed scenarios instead of assuming it works
+* Translating a real RevOps problem into a working automation
+* Identifying meaningful sales-deal risk signals
+* Designing deterministic business rules around those signals
+* Turning risk calculations into actionable outputs
+* Building and testing a multi-integration workflow in n8n
+* Understanding when native nodes are useful and when Code nodes provide a better abstraction
+* Using AI to analyse an existing automation rather than blindly generating one
+* Reading and reasoning about AI-generated JavaScript before implementing it
+* Thinking about state, alert fatigue, failure handling and maintainability
+* Iterating from a functioning first implementation toward a more robust design
 
 ---
 
 ## Limitations and future work
 
-**Known limitations**
+### Known limitations
 
-- Runs on a daily schedule. A deal that goes wrong at 09:00 isn't surfaced until the next morning.
-- Risk signals come from HubSpot properties only. Engagement quality, email sentiment and call content would need conversation-intelligence data the system doesn't have.
-- The assessment log grows by one row per deal per day. It's isolated in its own spreadsheet for headroom, but at high deal volume it will eventually need rotation.
-- Owner is stored as a HubSpot ID rather than a name, which keeps the workflow to a single API call but makes the sheets less readable.
-- Close-date push counts only become meaningful after a few weeks of history has accumulated.
+* Risk signals are limited by the information available in the connected CRM.
+* The workflow does not automatically know the full quality of customer conversations, sentiment, or buying-committee engagement unless those signals are available from integrated systems.
+* Historical assessment data can continue to grow and may eventually require a more scalable storage approach.
+* Recommended actions are suggestions for human review, not automatic sales actions.
+* The system can identify risk, but it does not guarantee that a deal will be won or lost.
 
-**Possible next steps**
+### Possible next steps
 
-- Track whether the recommended action was actually taken — the most consistent recommendation in pipeline-review practice, and currently the system's biggest blind spot
-- Add time-in-stage as a signal alongside activity age
-- A weekly digest for resolved deals, to close the loop without adding per-event Slack noise
-- Per-owner risk reporting from the assessment log
+* Track whether the recommended action was actually taken
+* Add time-in-stage as an additional signal
+* Add richer engagement and conversation-intelligence signals
+* Introduce owner-level and team-level risk reporting
+* Add periodic summaries without increasing real-time notification noise
+* Continue refining the scoring model using observed outcomes rather than assumptions
+
+---
+
+## Why both versions are included
+
+The final workflow is the more technically mature version, but the First Draft is important because it shows **how the system evolved**.
+
+The project progression is:
+
+```text
+Business problem
+      ↓
+First working implementation
+      ↓
+Structured review
+      ↓
+AI-assisted technical analysis
+      ↓
+Understanding and validating proposed changes
+      ↓
+Architecture optimization
+      ↓
+Final workflow
+```
+
+The goal of this repository is therefore not to present a workflow that appeared fully formed.
+
+It is to show the ability to:
+
+**understand the business problem → build a working solution → identify its weaknesses → use the right tools to improve it → understand what changed → validate the result.**
