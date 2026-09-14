@@ -68,7 +68,7 @@ At a high level, the system:
 
 ## Version 1 — the first working prototype
 
-**`workflows/01-deal-risk-monitoring-assessment-system-first-draft.json`**
+**`workflows/00-RevOps-Deal-Risk-Assessment-and-Alert-System.json`**
 
 This was my first substantial working implementation.
 
@@ -141,7 +141,7 @@ The first draft therefore became more than a prototype: it became the baseline I
 
 ## Version 2 — from working prototype to optimized system
 
-**`workflows/02-deal-risk-alert-system-optimized.json`**
+**`workflows/01-Final-RevOps-Deal-Risk-Assessment-and-Alert-System.json`**
 
 The first version proved the business logic. The next question was:
 
