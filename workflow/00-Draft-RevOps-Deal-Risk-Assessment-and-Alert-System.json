@@ -1,0 +1,1252 @@
+{
+  "name": "Draft 1 RevOps Deal Risk Monitoring & Assessment System",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -720,
+        80
+      ],
+      "id": "4fdd0adc-4a50-46ac-a86f-797e58ec68db",
+      "name": "Manual Test Trigger",
+      "notes": "Controlled test entry point."
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -720,
+        240
+      ],
+      "id": "46119905-927b-42b6-8aeb-d45ac08faa79",
+      "name": "Schedule Trigger",
+      "notes": "Runs every 6 hours when published."
+    },
+    {
+      "parameters": {
+        "authentication": "appToken",
+        "resource": "deal",
+        "operation": "search",
+        "returnAll": true,
+        "filterGroupsUi": {
+          "filterGroupsValues": [
+            {
+              "filtersUi": {
+                "filterValues": [
+                  {
+                    "propertyName": "dealstage",
+                    "operator": "NEQ",
+                    "value": "closedwon"
+                  },
+                  {
+                    "propertyName": "dealstage",
+                    "operator": "NEQ",
+                    "value": "closedlost"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "additionalFields": {
+          "properties": [
+            "dealname",
+            "amount",
+            "closedate",
+            "hs_lastmodifieddate",
+            "pipeline",
+            "hubspot_owner_id",
+            "hs_next_step",
+            "dealstage"
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.hubspot",
+      "typeVersion": 2.2,
+      "position": [
+        -496,
+        160
+      ],
+      "id": "e539f0dd-e371-49d0-a6a2-442120cc3920",
+      "name": "HubSpot - Read Open Deals",
+      "credentials": {
+        "hubspotAppToken": {
+          "id": "GITHUB_PUBLIC_CREDENTIAL_PLACEHOLDER",
+          "name": "GITHUB_PUBLIC_CREDENTIAL"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "notes": "Reads open opportunities needed for risk assessment; no cosmetic CRM cleanup."
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().map(item => {\n  const $json = item.json;\n  const p = $json.properties ?? {};\n  const now = Date.now();\n  const MS_PER_DAY = 86400000;\n\n  // Parsed Fields\n  const dealId = String($json.id ?? '');\n  const dealName = String(p.dealname ?? '').trim();\n  const rawAmount = p.amount === '' || p.amount == null ? null : Number(p.amount);\n  const amount = Number.isFinite(rawAmount) ? rawAmount : null;\n  const closeDate = p.closedate ? new Date(p.closedate) : null;\n  const lastModified = p.hs_lastmodifieddate ? new Date(p.hs_lastmodifieddate) : null;\n  const stage = String(p.dealstage ?? '');\n  const pipeline = String(p.pipeline ?? '');\n  const ownerId = String(p.hubspot_owner_id ?? '');\n  const nextStep = String(p.hs_next_step ?? '').trim();\n\n  // State\n  const issues = [];\n  const riskDrivers = [];\n  const scoreBreakdown = { base: 0 };\n  let riskScore = 0;\n  let highestIssueSeverity = 'NONE';\n\n  // Severity Ranking Map\n  const severityRank = {\n    NONE: 0,\n    LOW: 1,\n    MEDIUM: 2,\n    HIGH: 3,\n    CRITICAL: 4\n  };\n\n  // Helper function to handle issue logging cleanly\n  function addRisk(code, severity, points, driverMsg, breakdownKey, detail = null) {\n    issues.push({ code, severity, points, ...(detail && { detail }) });\n    riskScore += points;\n    scoreBreakdown[breakdownKey] = points;\n    riskDrivers.push(driverMsg);\n    \n    // Evaluate highest severity using the rank map\n    if (severityRank[severity] > severityRank[highestIssueSeverity]) {\n      highestIssueSeverity = severity;\n    }\n  }\n\n  // 1. Forecast & Accountability Risk\n  if (amount == null || !Number.isFinite(amount) || amount <= 0) {\n    addRisk('MISSING_OR_INVALID_AMOUNT', 'HIGH', 15, 'Deal value missing/invalid, reducing forecast reliability.', 'missingAmount');\n  }\n  if (!ownerId) {\n    addRisk('UNASSIGNED_DEAL', 'HIGH', 10, 'No deal owner assigned, creating execution risk.', 'missingOwner');\n  }\n  if (!nextStep) {\n    addRisk('MISSING_NEXT_STEP', 'MEDIUM', 10, 'No documented next step, increasing execution risk.', 'missingNextStep');\n  }\n\n  // 2. Close Date Slippage Risk\n  let daysToClose = null;\n  if (!closeDate || Number.isNaN(closeDate.getTime())) {\n    addRisk('MISSING_CLOSE_DATE', 'HIGH', 15, 'No reliable close date available for forecasting.', 'missingCloseDate');\n  } else {\n    daysToClose = Math.ceil((closeDate.getTime() - now) / MS_PER_DAY);\n    if (daysToClose < 0) {\n      const expiredDays = Math.abs(daysToClose);\n      const points = expiredDays >= 91 ? 35 : expiredDays >= 61 ? 30 : expiredDays >= 31 ? 25 : expiredDays >= 15 ? 20 : expiredDays >= 8 ? 15 : 10;\n      const severity = expiredDays >= 15 ? 'HIGH' : 'MEDIUM';\n      addRisk('EXPIRED_CLOSE_DATE', severity, points, `Close date ${expiredDays} days overdue, indicating forecast slippage.`, 'expiredCloseDate', `Expired ${expiredDays} days ago`);\n    }\n  }\n\n  // 3. Momentum & Stalled Deal Risk\n  let inactiveDays = null; // null = unknown, not \"fresh\"\n  if (!lastModified || Number.isNaN(lastModified.getTime())) {\n    addRisk('MISSING_ACTIVITY_DATA', 'MEDIUM', 5, 'Activity timestamp missing, limiting momentum assessment.', 'missingLastModified');\n  } else {\n    inactiveDays = Math.max(0, Math.floor((now - lastModified.getTime()) / MS_PER_DAY));\n    if (inactiveDays >= 60) {\n      addRisk('SEVERELY_STALLED_DEAL', 'HIGH', 25, `No CRM update for ${inactiveDays} days, deal momentum is dead.`, 'severelyStaleDeal');\n    } else if (inactiveDays >= 30) {\n      addRisk('STALLED_DEAL', 'HIGH', 20, `No CRM update for ${inactiveDays} days, deal is stalling.`, 'staleDeal');\n    } else if (inactiveDays >= 14) {\n      addRisk('LOSING_MOMENTUM', 'MEDIUM', 10, `Activity aging at ${inactiveDays} days, momentum slowing.`, 'agingActivity');\n    }\n  }\n\n  // 4. Execution Gap (Unrealistic Pipeline)\n  if (daysToClose !== null && daysToClose >= 0 && daysToClose <= 7 && (!nextStep || inactiveDays === null || inactiveDays >= 7)) {\n    addRisk('NEAR_CLOSE_EXECUTION_GAP', 'HIGH', 15, `Close date is ${daysToClose} days away without reliable execution signal.`, 'nearCloseExecutionGap');\n  }\n\n  // 5. Final Scoring\n  const highValue = Number.isFinite(amount) && amount >= 100000;\n  if (highValue && riskScore > 0) riskDrivers.push('High-value opportunity: prioritize risk review.');\n  \n  riskScore = Math.max(0, Math.min(100, riskScore));\n  const riskLevel = riskScore >= 60 ? 'CRITICAL' : riskScore >= 40 ? 'HIGH' : riskScore >= 20 ? 'MODERATE' : 'LOW';\n\n  return {\n    json: {\n      dealId, dealName, amount, stage, pipeline, ownerId, nextStep,\n      closeDate: p.closedate || null,\n      lastModified: p.hs_lastmodifieddate || null,\n      inactiveDays, daysToClose, highValue, riskScore, riskLevel,\n      highestIssueSeverity, issues,\n      issueCodes: issues.map(i => i.code),\n      issueCount: issues.length,\n      riskDrivers: [...new Set(riskDrivers)],\n      scoreBreakdown: { ...scoreBreakdown, final: riskScore },\n      assessedAt: new Date().toISOString()\n    }\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -256,
+        160
+      ],
+      "id": "71c1f8e3-f1b8-45a2-b090-e0a838b6cbb1",
+      "name": "Code - Deal Risk Engine",
+      "notes": "Core deterministic revenue/deal-risk assessment."
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows=$input.all().map(i=>i.json);let low=0,moderate=0,high=0,critical=0,highValueRiskCount=0,exposure=0;for(const r of rows){if(r.riskLevel==='LOW')low++;else if(r.riskLevel==='MODERATE')moderate++;else if(r.riskLevel==='HIGH')high++;else if(r.riskLevel==='CRITICAL')critical++;if(r.highValue&&(r.riskLevel==='HIGH'||r.riskLevel==='CRITICAL'))highValueRiskCount++;if((r.riskLevel==='HIGH'||r.riskLevel==='CRITICAL')&&Number.isFinite(Number(r.amount)))exposure+=Number(r.amount);}return [{json:{runTimestamp:new Date().toISOString(),executionId:$execution.id,dealsScanned:rows.length,lowRiskCount:low,moderateRiskCount:moderate,highRiskCount:high,criticalRiskCount:critical,highValueRiskCount,totalExposureHighCritical:exposure}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        336
+      ],
+      "id": "bcc877bf-fe85-490c-b68b-d032d6721a0e",
+      "name": "Code - Build Run Summary",
+      "notes": "Builds one KPI row per scan execution."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.riskLevel }}",
+              "rightValue": "HIGH",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "leftValue": "={{ $json.riskLevel }}",
+              "rightValue": "CRITICAL",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        192,
+        160
+      ],
+      "id": "4925f71f-eef2-4a16-a851-e79b71f5c5fc",
+      "name": "IF - High/Critical Risk",
+      "notes": "Only HIGH and CRITICAL opportunities receive AI analysis; LOW/MODERATE deals skip the LLM call."
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are a senior Revenue Operations risk analyst.\nAssess the following OPEN sales opportunity for revenue, forecast, and execution risk.\n\nDeal ID: {{ $json.dealId }}\\nDeal: {{ $json.dealName }}\nAmount: {{ $json.amount }}\nStage: {{ $json.stage }}\nPipeline: {{ $json.pipeline }}\nClose date: {{ $json.closeDate }}\nDays to close: {{ $json.daysToClose }}\nInactive days: {{ $json.inactiveDays }}\nHigh-value deal: {{ $json.highValue }}\nDeterministic risk score: {{ $json.riskScore }}/100\nRisk level: {{ $json.riskLevel }}\nDetected issues: {{ JSON.stringify($json.issues) }}\nRisk drivers: {{ JSON.stringify($json.riskDrivers) }}\n\nRules:\n- Do not invent facts.\n- Do not state that the full deal amount is lost revenue.\n- Explain the business/forecast impact of the observed signals.\n- Recommend one concrete action based only on the observed risk signals.\n- Do not invent company-specific timelines, SLAs, meetings, or process requirements.\n- Do not recommend automatic changes to amount, owner, stage, or close date.\n- Be concise and operational.\n- Return the Deal ID exactly as provided; do not alter it.\\n- The deterministic risk level is authoritative. Do not attempt to upgrade or downgrade the risk level.",
+        "hasOutputParser": true,
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        448,
+        160
+      ],
+      "id": "507346d4-20d9-4813-8b22-dd89e91d28d1",
+      "name": "AI - Revenue Risk Analyst",
+      "onError": "continueErrorOutput",
+      "notes": "AI interprets business impact and recommends action; deterministic risk data is reattached using the exact deal ID returned by the structured AI output."
+    },
+    {
+      "parameters": {
+        "model": "openai/gpt-oss-120b",
+        "options": {
+          "temperature": 0
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        448,
+        352
+      ],
+      "id": "31c65aa2-11fe-4c0c-b486-13c9bd2978c0",
+      "name": "Groq Chat Model",
+      "credentials": {
+        "groqApi": {
+          "id": "GITHUB_PUBLIC_CREDENTIAL_PLACEHOLDER",
+          "name": "GITHUB_PUBLIC_CREDENTIAL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const riskItems = $('IF - High/Critical Risk').all().map(item => item.json);\nconst aiItems = $input.all().map(item => item.json);\n\n// Reattach deterministic risk data using the deal ID, not n8n item-linking metadata\n// and not array position. This remains correct if item order changes downstream.\nconst riskByDealId = new Map(\n  riskItems.map(risk => [String(risk.dealId), risk])\n);\n\nconst results = [];\n\nfor (let index = 0; index < aiItems.length; index++) {\n  const ai = aiItems[index].output ?? {};\n  const dealId = String(ai.deal_id ?? '').trim();\n\n  if (!dealId) {\n    throw new Error(`AI output is missing deal_id for item ${index}. Refusing to attach risk data by position.`);\n  }\n\n  const risk = riskByDealId.get(dealId);\n\n  if (!risk) {\n    throw new Error(`AI returned unknown deal_id \"${dealId}\" for item ${index}. Refusing to build an action.`);\n  }\n\n  const systemUrgency =\n    risk.riskLevel === 'CRITICAL'\n      ? 'CRITICAL'\n      : risk.riskLevel === 'HIGH'\n        ? 'HIGH'\n        : 'MEDIUM';\n\n  const clean = (value, fallback) =>\n    typeof value === 'string' && value.trim()\n      ? value.trim()\n      : fallback;\n\n  results.push({\n    json: {\n      ...risk,\n      aiRiskAssessment: clean(\n        ai.risk_assessment,\n        'High-risk opportunity requires review.'\n      ),\n      aiBusinessImpact: clean(\n        ai.business_impact,\n        'Potential forecast or execution risk identified.'\n      ),\n      aiNextBestAction: clean(\n        ai.next_best_action,\n        'Review the highest-priority risk driver.'\n      ),\n      systemUrgency,\n      humanReviewRequired: true,\n      actionStatus: 'REVIEW_REQUIRED'\n    }\n  });\n}\n\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        800,
+        160
+      ],
+      "id": "d576c3a6-341b-4b05-8ed5-82f601b3838b",
+      "name": "Code - Build Risk Action",
+      "notes": "Reattaches deterministic risk data to AI output by exact deal_id; never relies on .item pairing or array position."
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.riskLevel }}",
+                    "rightValue": "CRITICAL",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "CRITICAL"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 1
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.riskLevel }}",
+                    "rightValue": "HIGH",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "HIGH"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        1040,
+        256
+      ],
+      "id": "d8c5f178-8481-4f97-b56d-5f4838368e04",
+      "name": "Switch - Risk Severity",
+      "notes": "Routes operational alerts by risk severity."
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#revops-risk",
+          "mode": "name"
+        },
+        "text": "={{ `🚨 *CRITICAL DEAL RISK*\\n\\n*Deal:* ${$json.dealName}\\n*Amount:* ${$json.amount ?? 'MISSING'}\\n*Risk:* ${$json.riskScore}/100 (${ $json.riskLevel })\\n\\n*Risk Drivers:*\\n• ${$json.riskDrivers.join('\\n• ')}\\n\\n*AI Assessment:* ${$json.aiRiskAssessment}\\n\\n*Next Best Action:* ${$json.aiNextBestAction}\\n\\n*Human Review:* Required` }}",
+        "otherOptions": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.7,
+      "position": [
+        1280,
+        112
+      ],
+      "id": "9ed33ef4-ec56-4911-86c3-3130ef9aea0c",
+      "name": "Slack - Critical Risk Alert",
+      "webhookId": "GITHUB_PUBLIC_WEBHOOK_PLACEHOLDER",
+      "credentials": {
+        "slackApi": {
+          "id": "GITHUB_PUBLIC_CREDENTIAL_PLACEHOLDER",
+          "name": "GITHUB_PUBLIC_CREDENTIAL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#revops-risk",
+          "mode": "name"
+        },
+        "text": "={{ `⚠️ *HIGH DEAL RISK*\\n\\n*Deal:* ${$json.dealName}\\n*Amount:* ${$json.amount ?? 'MISSING'}\\n*Risk:* ${$json.riskScore}/100 (${ $json.riskLevel })\\n\\n*Risk Drivers:*\\n• ${$json.riskDrivers.join('\\n• ')}\\n\\n*AI Assessment:* ${$json.aiRiskAssessment}\\n\\n*Next Best Action:* ${$json.aiNextBestAction}\\n\\n*Human Review:* Required` }}",
+        "otherOptions": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.7,
+      "position": [
+        1280,
+        272
+      ],
+      "id": "d02e7832-fdba-4b63-9cca-fda654584b7c",
+      "name": "Slack - High Risk Alert",
+      "webhookId": "GITHUB_PUBLIC_WEBHOOK_PLACEHOLDER",
+      "credentials": {
+        "slackApi": {
+          "id": "GITHUB_PUBLIC_CREDENTIAL_PLACEHOLDER",
+          "name": "GITHUB_PUBLIC_CREDENTIAL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1qjsoIvnE3nMatWjCP1vCpqLfJLmaEhY21j3pGwMWU5k",
+          "mode": "list",
+          "cachedResultName": "Ops",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEETS_SPREADSHEET_ID/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Deal Risk Assessment",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEETS_SPREADSHEET_ID/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "deal_id": "={{ $json.dealId }}",
+            "deal_name": "={{ $json.dealName }}",
+            "amount": "={{ $json.amount }}",
+            "stage": "={{ $json.stage }}",
+            "pipeline": "={{ $json.pipeline }}",
+            "close_date": "={{ $json.closeDate }}",
+            "last_modified": "={{ $json.lastModified }}",
+            "inactive_days": "={{ $json.inactiveDays }}",
+            "days_to_close": "={{ $json.daysToClose }}",
+            "high_value": "={{ $json.highValue }}",
+            "risk_score": "={{ $json.riskScore }}",
+            "issue_codes": "={{ $json.issueCodes.join(', ') }}",
+            "issue_count": "={{ $json.issueCount }}",
+            "risk_drivers": "={{ $json.riskDrivers.join(', ') }}",
+            "score_breakdown": "={{ JSON.stringify($json.scoreBreakdown) }}",
+            "execution_id": "={{ $execution.id }}",
+            "timestamp": "={{ $json.assessedAt }}",
+            "highest_issue_severity": "={{ $json.highestIssueSeverity }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "deal_id",
+              "displayName": "deal_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "deal_name",
+              "displayName": "deal_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "amount",
+              "displayName": "amount",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "stage",
+              "displayName": "stage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "pipeline",
+              "displayName": "pipeline",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "close_date",
+              "displayName": "close_date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "last_modified",
+              "displayName": "last_modified",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "inactive_days",
+              "displayName": "inactive_days",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "days_to_close",
+              "displayName": "days_to_close",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "high_value",
+              "displayName": "high_value",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "risk_score",
+              "displayName": "risk_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "highest_issue_severity",
+              "displayName": "highest_issue_severity",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "issue_codes",
+              "displayName": "issue_codes",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "issue_count",
+              "displayName": "issue_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "risk_drivers",
+              "displayName": "risk_drivers",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "score_breakdown",
+              "displayName": "score_breakdown",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "execution_id",
+              "displayName": "execution_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        0,
+        0
+      ],
+      "id": "98a32e16-95de-4601-a01d-9c8911990f42",
+      "name": "Sheet - Deal Risk Assessment",
+      "credentials": {
+        "googleApi": {
+          "id": "GITHUB_PUBLIC_CREDENTIAL_PLACEHOLDER",
+          "name": "GITHUB_PUBLIC_CREDENTIAL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1qjsoIvnE3nMatWjCP1vCpqLfJLmaEhY21j3pGwMWU5k",
+          "mode": "list",
+          "cachedResultName": "Ops",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEETS_SPREADSHEET_ID/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 85204103,
+          "mode": "list",
+          "cachedResultName": "Risk Scan Summary",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEETS_SPREADSHEET_ID/edit#gid=85204103"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "run_timestamp": "={{ $json.runTimestamp }}",
+            "execution_id": "={{ $json.executionId }}",
+            "deals_scanned": "={{ $json.dealsScanned }}",
+            "low_risk_count": "={{ $json.lowRiskCount }}",
+            "moderate_risk_count": "={{ $json.moderateRiskCount }}",
+            "high_risk_count": "={{ $json.highRiskCount }}",
+            "critical_risk_count": "={{ $json.criticalRiskCount }}",
+            "high_value_risk_count": "={{ $json.highValueRiskCount }}",
+            "total_exposure_high_critical": "={{ $json.totalExposureHighCritical }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "run_timestamp",
+              "displayName": "run_timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "execution_id",
+              "displayName": "execution_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "deals_scanned",
+              "displayName": "deals_scanned",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "low_risk_count",
+              "displayName": "low_risk_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "moderate_risk_count",
+              "displayName": "moderate_risk_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "high_risk_count",
+              "displayName": "high_risk_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "critical_risk_count",
+              "displayName": "critical_risk_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "high_value_risk_count",
+              "displayName": "high_value_risk_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "total_exposure_high_critical",
+              "displayName": "total_exposure_high_critical",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        192,
+        336
+      ],
+      "id": "4dd7472c-948c-4fb8-94c9-d08ac0635c38",
+      "name": "Sheet - Risk Scan Summary",
+      "credentials": {
+        "googleApi": {
+          "id": "GITHUB_PUBLIC_CREDENTIAL_PLACEHOLDER",
+          "name": "GITHUB_PUBLIC_CREDENTIAL"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "1qjsoIvnE3nMatWjCP1vCpqLfJLmaEhY21j3pGwMWU5k",
+          "mode": "list",
+          "cachedResultName": "Ops",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEETS_SPREADSHEET_ID/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 1632358347,
+          "mode": "list",
+          "cachedResultName": "RevOps Action Queue",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEETS_SPREADSHEET_ID/edit#gid=1632358347"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "deal_id": "={{ $json.dealId }}",
+            "deal_name": "={{ $json.dealName }}",
+            "amount": "={{ $json.amount }}",
+            "risk_score": "={{ $json.riskScore }}",
+            "risk_level": "={{ $json.riskLevel }}",
+            "issue_codes": "={{ $json.issueCodes.join(', ') }}",
+            "risk_drivers": "={{ $json.riskDrivers.join(' | ') }}",
+            "timestamp": "={{ $json.assessedAt }}",
+            "ai_risk_assessment": "={{ $json.aiRiskAssessment }}",
+            "ai_business_impact": "={{ $json.aiBusinessImpact }}",
+            "ai_next_best_action": "={{ $json.aiNextBestAction }}",
+            "human_review_required": "={{ $json.humanReviewRequired }}",
+            "action_status": "={{ $json.actionStatus }}",
+            "execution_id": "={{ $execution.id }}",
+            "days_to_close": "={{ $json.daysToClose }}",
+            "inactive_days": "={{ $json.inactiveDays }}",
+            "system_urgency": "={{ $json.systemUrgency }}"
+          },
+          "matchingColumns": [
+            "deal_id"
+          ],
+          "schema": [
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "deal_id",
+              "displayName": "deal_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "deal_name",
+              "displayName": "deal_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "amount",
+              "displayName": "amount",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "risk_score",
+              "displayName": "risk_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "risk_level",
+              "displayName": "risk_level",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "issue_codes",
+              "displayName": "issue_codes",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "risk_drivers",
+              "displayName": "risk_drivers",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "ai_risk_assessment",
+              "displayName": "ai_risk_assessment",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "ai_business_impact",
+              "displayName": "ai_business_impact",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "ai_next_best_action",
+              "displayName": "ai_next_best_action",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "system_urgency",
+              "displayName": "system_urgency",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "human_review_required",
+              "displayName": "human_review_required",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "action_status",
+              "displayName": "action_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "execution_id",
+              "displayName": "execution_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "days_to_close",
+              "displayName": "days_to_close",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "inactive_days",
+              "displayName": "inactive_days",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1024,
+        16
+      ],
+      "id": "70490362-fa82-4808-ba0c-e6f5ff423afb",
+      "name": "Sheet - RevOps Action Queue",
+      "credentials": {
+        "googleApi": {
+          "id": "GITHUB_PUBLIC_CREDENTIAL_PLACEHOLDER",
+          "name": "GITHUB_PUBLIC_CREDENTIAL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"deal_id\": {\n      \"type\": \"string\",\n      \"minLength\": 1\n    },\n    \"risk_assessment\": {\n      \"type\": \"string\",\n      \"minLength\": 1\n    },\n    \"business_impact\": {\n      \"type\": \"string\",\n      \"minLength\": 1\n    },\n    \"next_best_action\": {\n      \"type\": \"string\",\n      \"minLength\": 1\n    }\n  },\n  \"required\": [\n    \"deal_id\",\n    \"risk_assessment\",\n    \"business_impact\",\n    \"next_best_action\"\n  ],\n  \"additionalProperties\": false\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        592,
+        352
+      ],
+      "id": "7e10930c-4194-415e-8b84-7f4ab4af5ff3",
+      "name": "Parser - Strict JSON Schema",
+      "notes": "Validates AI output including the exact deal ID used to reattach deterministic risk data."
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#revops-risk",
+          "mode": "name"
+        },
+        "text": "={{ `⚠️ *RISK ROUTING EXCEPTION*\\n\\nAn unexpected risk level reached the alert router.\\n\\n*Deal:* ${$json.dealName ?? 'Unknown'}\\n*Risk:* ${$json.riskScore ?? 'Unknown'}/100 (${ $json.riskLevel ?? 'UNKNOWN' })\\n\\nPlease inspect the workflow output and routing rules.` }}",
+        "otherOptions": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.7,
+      "position": [
+        1280,
+        448
+      ],
+      "id": "dd234044-a2d6-405f-bf02-80349b9a280a",
+      "name": "Slack - Risk Routing Exception",
+      "webhookId": "GITHUB_PUBLIC_WEBHOOK_PLACEHOLDER",
+      "credentials": {
+        "slackApi": {
+          "id": "GITHUB_PUBLIC_CREDENTIAL_PLACEHOLDER",
+          "name": "GITHUB_PUBLIC_CREDENTIAL"
+        }
+      },
+      "notes": "Defensive fallback for an unexpected risk level reaching the alert router."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const err = $json.error ?? {};\nreturn {\n  json: {\n    failedNode: 'HubSpot - Read Open Deals',\n    errorMessage: String(err.message ?? err ?? 'Unknown HubSpot error'),\n    occurredAt: new Date().toISOString(),\n    executionId: $execution.id\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -256,
+        432
+      ],
+      "id": "8f694ce7-e0c7-48e9-9e6d-97a5f92ffb47",
+      "name": "Code - Format HubSpot Error",
+      "notes": "Formats HubSpot read errors for operational alerting."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const err = $json.error ?? {};\nreturn {\n  json: {\n    failedNode: 'AI - Revenue Risk Analyst',\n    errorMessage: String(err.message ?? err ?? 'Unknown AI error'),\n    occurredAt: new Date().toISOString(),\n    executionId: $execution.id\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        592,
+        528
+      ],
+      "id": "0d10d174-aee1-4bc9-b9fc-46a6f5a7a9cc",
+      "name": "Code - Format AI Error",
+      "notes": "Formats AI analysis errors for operational alerting."
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#revops-risk",
+          "mode": "name"
+        },
+        "text": "={{ `🛑 *WORKFLOW ERROR*\\n\\n*Node:* ${$json.failedNode ?? 'Unknown'}\\n*Error:* ${$json.errorMessage ?? 'Unknown error'}\\n*Execution:* ${$json.executionId ?? 'Unknown'}\\n*Time:* ${$json.occurredAt ?? 'Unknown'}\\n\\nManual investigation required.` }}",
+        "otherOptions": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.7,
+      "position": [
+        848,
+        512
+      ],
+      "id": "3a19a018-fb2a-4a76-b3b1-3324df10eddd",
+      "name": "Slack - Workflow Error Alert",
+      "webhookId": "GITHUB_PUBLIC_WEBHOOK_PLACEHOLDER",
+      "credentials": {
+        "slackApi": {
+          "id": "GITHUB_PUBLIC_CREDENTIAL_PLACEHOLDER",
+          "name": "GITHUB_PUBLIC_CREDENTIAL"
+        }
+      },
+      "notes": "Alerts the RevOps risk channel when HubSpot or AI processing fails."
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Manual Test Trigger": {
+      "main": [
+        [
+          {
+            "node": "HubSpot - Read Open Deals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "HubSpot - Read Open Deals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HubSpot - Read Open Deals": {
+      "main": [
+        [
+          {
+            "node": "Code - Deal Risk Engine",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code - Format HubSpot Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Deal Risk Engine": {
+      "main": [
+        [
+          {
+            "node": "Code - Build Run Summary",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "IF - High/Critical Risk",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Sheet - Deal Risk Assessment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Build Run Summary": {
+      "main": [
+        [
+          {
+            "node": "Sheet - Risk Scan Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI - Revenue Risk Analyst": {
+      "main": [
+        [
+          {
+            "node": "Code - Build Risk Action",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Code - Format AI Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Build Risk Action": {
+      "main": [
+        [
+          {
+            "node": "Switch - Risk Severity",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Sheet - RevOps Action Queue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch - Risk Severity": {
+      "main": [
+        [
+          {
+            "node": "Slack - Critical Risk Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack - High Risk Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack - Risk Routing Exception",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI - Revenue Risk Analyst",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parser - Strict JSON Schema": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "AI - Revenue Risk Analyst",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Format HubSpot Error": {
+      "main": [
+        [
+          {
+            "node": "Slack - Workflow Error Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Format AI Error": {
+      "main": [
+        [
+          {
+            "node": "Slack - Workflow Error Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF - High/Critical Risk": {
+      "main": [
+        [
+          {
+            "node": "AI - Revenue Risk Analyst",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "GITHUB_PUBLIC_VERSION_PLACEHOLDER",
+  "meta": {
+    "instanceId": "GITHUB_PUBLIC_INSTANCE_PLACEHOLDER"
+  },
+  "nodeGroups": [],
+  "id": "GITHUB_PUBLIC_WORKFLOW_PLACEHOLDER",
+  "tags": []
+}
