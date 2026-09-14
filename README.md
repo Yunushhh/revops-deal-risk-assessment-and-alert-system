@@ -1,4 +1,4 @@
-# RevOps Deal Risk Alert System
+# RevOps Deal Risk Assessment & Alert System
 
 An n8n automation that scores every open HubSpot deal each morning, explains *why* a deal is at risk, maintains an action queue in Google Sheets, and sends Slack alerts only when something has genuinely changed.
 
