@@ -1,0 +1,137 @@
+{
+  "name": "Shared Error Handler",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "c0647025-7b58-4c5d-8016-076b257093a3",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "notes": "Fires when any workflow that names this one as its Error Workflow fails with an UNHANDLED error. Handled errors - nodes with an error output wired - never reach here by design; those are reported inside the workflow itself.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "/**\n * Normalises the Error Trigger payload into a flat, notification-ready shape.\n *\n * n8n emits TWO different payload shapes and this handles both:\n *   - an execution failed  -> payload.execution  (has id, url, lastNodeExecuted)\n *   - a trigger failed     -> payload.trigger    (no execution id, no url)\n * Reading only payload.execution would silently produce a blank report whenever\n * a polling or schedule trigger is what broke.\n */\nconst payload = ($input.first() && $input.first().json) || {};\nconst wf = payload.workflow || {};\nconst isExecution = !!payload.execution;\nconst ex = payload.execution || payload.trigger || {};\nconst err = ex.error || {};\n\nconst str = (v) => (v === null || v === undefined) ? '' : String(v);\nconst clip = (v, n) => {\n  const s = str(v);\n  return s.length > n ? s.slice(0, n - 3) + '...' : s;\n};\n\n// Slack has message size limits and a stack trace can be enormous.\nconst failedNode = (err.node && err.node.name) || ex.lastNodeExecuted || 'Unknown node';\n\nreturn [{\n  json: {\n    workflowName: str(wf.name) || 'Unknown workflow',\n    workflowId: str(wf.id),\n    failureType: isExecution ? 'EXECUTION' : 'TRIGGER',\n    executionId: str(ex.id) || 'n/a (trigger failure)',\n    executionUrl: str(ex.url),\n    executionMode: str(ex.mode) || 'unknown',\n    retryOf: str(ex.retryOf),\n    failedNode,\n    failedNodeType: str(err.node && err.node.type),\n    errorName: str(err.name) || 'Error',\n    errorMessage: clip(err.message || err.description || 'No error message reported', 800),\n    errorStack: clip(err.stack, 1200),\n    occurredAt: new Date().toISOString()\n  }\n}];\n"
+      },
+      "id": "003d56d4-e05d-40b9-93b4-f6c584a784d9",
+      "name": "Code - Build Failure Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        0
+      ],
+      "notes": "Flattens the Error Trigger payload. Handles both the execution-failure and trigger-failure shapes, and clips the stack trace so a huge trace cannot make the notification itself fail.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "YOUR_WORKFLOW_ERROR_CHANNEL_ID",
+          "mode": "id",
+          "cachedResultName": "workflow-error"
+        },
+        "text": "={{ `\\ud83d\\udd34 *WORKFLOW FAILED*\\n\\n*Workflow:* ${ $json.workflowName }\\n*Failed node:* ${ $json.failedNode }\\n*Error type:* ${ $json.errorName }\\n*Failure type:* ${ $json.failureType } (mode: ${ $json.executionMode })\\n*Execution:* ${ $json.executionId }\\n*Time:* ${ $json.occurredAt }\\n\\n*Error:*\\n${ $json.errorMessage }${ $json.executionUrl ? '\\n\\n<' + $json.executionUrl + '|Open execution in n8n>' : '\\n\\n_No execution URL - the trigger itself failed._' }` }}",
+        "otherOptions": {}
+      },
+      "id": "7ebdb689-dd1a-4328-aacb-29970c1c80d8",
+      "name": "Slack - Workflow Failure Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.7,
+      "position": [
+        520,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueErrorOutput",
+      "notes": "Primary notification. Retries three times first, so a transient Slack blip does not immediately escalate to email. If it still fails, output 2 hands over to the email fallback - a Slack outage must not swallow the only alert.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "fromEmail": "YOUR_ALERT_FROM_ADDRESS",
+        "toEmail": "YOUR_ONCALL_EMAIL_ADDRESS",
+        "subject": "=n8n failure: {{ $('Code - Build Failure Report').first().json.workflowName }} ({{ $('Code - Build Failure Report').first().json.failedNode }})",
+        "emailFormat": "text",
+        "text": "=Slack delivery failed, so this failure is being reported by email instead.\n\nWorkflow:     {{ $('Code - Build Failure Report').first().json.workflowName }}\nFailed node:  {{ $('Code - Build Failure Report').first().json.failedNode }}\nError type:   {{ $('Code - Build Failure Report').first().json.errorName }}\nFailure type: {{ $('Code - Build Failure Report').first().json.failureType }}\nExecution:    {{ $('Code - Build Failure Report').first().json.executionId }}\nTime:         {{ $('Code - Build Failure Report').first().json.occurredAt }}\n\nError message:\n{{ $('Code - Build Failure Report').first().json.errorMessage }}\n\nExecution URL:\n{{ $('Code - Build Failure Report').first().json.executionUrl || 'not available (trigger failure)' }}\n\nStack trace:\n{{ $('Code - Build Failure Report').first().json.errorStack || 'not available' }}\n",
+        "options": {}
+      },
+      "id": "ee234cb4-b2e8-42ed-8b56-bb32b94bb994",
+      "name": "Email - Workflow Failure Fallback",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        780,
+        160
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "notes": "Out-of-band fallback on a different transport. Reads the report by node name rather than from the Slack error item, so it does not depend on the shape of an error payload. Left on the default stopWorkflow: if email fails too, this run goes red, which is the last remaining signal.",
+      "notesInFlow": true
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Code - Build Failure Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Build Failure Report": {
+      "main": [
+        [
+          {
+            "node": "Slack - Workflow Failure Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack - Workflow Failure Alert": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Email - Workflow Failure Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email - Workflow Failure Fallback": {
+      "main": [
+        []
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": true
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

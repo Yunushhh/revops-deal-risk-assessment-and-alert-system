@@ -1,5 +1,5 @@
 {
-  "name": "Draft 1 RevOps Deal Risk Monitoring & Assessment System",
+  "name": "RevOps Deal Risk Assessment & Alert System - Draft",
   "nodes": [
     {
       "parameters": {},
@@ -339,7 +339,7 @@
         "operation": "append",
         "documentId": {
           "__rl": true,
-          "value": "1qjsoIvnE3nMatWjCP1vCpqLfJLmaEhY21j3pGwMWU5k",
+          "value": "YOUR_GOOGLE_SHEETS_SPREADSHEET_ID",
           "mode": "list",
           "cachedResultName": "Ops",
           "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEETS_SPREADSHEET_ID/edit?usp=drivesdk"
@@ -582,7 +582,7 @@
         "operation": "append",
         "documentId": {
           "__rl": true,
-          "value": "1qjsoIvnE3nMatWjCP1vCpqLfJLmaEhY21j3pGwMWU5k",
+          "value": "YOUR_GOOGLE_SHEETS_SPREADSHEET_ID",
           "mode": "list",
           "cachedResultName": "Ops",
           "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEETS_SPREADSHEET_ID/edit?usp=drivesdk"
@@ -718,7 +718,7 @@
         "operation": "appendOrUpdate",
         "documentId": {
           "__rl": true,
-          "value": "1qjsoIvnE3nMatWjCP1vCpqLfJLmaEhY21j3pGwMWU5k",
+          "value": "YOUR_GOOGLE_SHEETS_SPREADSHEET_ID",
           "mode": "list",
           "cachedResultName": "Ops",
           "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEETS_SPREADSHEET_ID/edit?usp=drivesdk"
